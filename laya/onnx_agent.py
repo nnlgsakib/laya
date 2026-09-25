@@ -7,13 +7,18 @@ from typing import Any, Dict, Optional, Union
 
 import numpy as np
 
-from laya.hooks import HookRegistry, PredictContext, aggregate_usage, compose_hooks, dispatch, normalise_hooks
+from laya.hooks import (
+    HookRegistry, PredictContext, aggregate_usage, compose_hooks, dispatch, normalise_hooks,
+    validate_timeout,
+)
+from laya.revisions import resolve_revision, snapshot_revision, verify_digests
 from laya.common import (
     QTYPES,
     answer_confidence,
     build_sequence,
     collate_items,
     confidence_from_probs,
+    encode_text,
     render_options,
     serialize_state,
     temp_bucket,
@@ -30,6 +35,7 @@ class ONNXAgent(HookRegistry):
     # `hooks`/`_hooks_mutex` come from HookRegistry.
     hooks_raise = True
     hooks_concurrent = True
+    hooks_timeout = None
     _hooks_lock = None
     model_id = None
 
@@ -38,11 +44,14 @@ class ONNXAgent(HookRegistry):
         model_id_or_path: str,
         onnx_path: str = "laya.onnx",
         subfolder: Optional[str] = None,
+        revision: Optional[str] = None,
+        expected_sha256: Optional[Dict[str, str]] = None,
         hooks=None,
         on_predict_start=None,
         on_predict_end=None,
         hooks_raise: bool = True,
         hooks_concurrent: bool = True,
+        hooks_timeout: Optional[float] = None,
     ):
         """Load a Laya agent backed by ONNX Runtime.
 
@@ -51,15 +60,24 @@ class ONNXAgent(HookRegistry):
                               (used to load the tokenizer and config).
             onnx_path: Path to the exported .onnx file.
             subfolder: Optional subfolder if downloading from a repo bundle.
+            revision: Optional Hub revision (commit SHA/branch/tag). When omitted,
+                      huggingface_hub's normal default and existing offline cache are used.
+            expected_sha256: Optional {path relative to the checkpoint dir: hexdigest}
+                      verified before any checkpoint file is parsed; opt-in, and applies
+                      to local directories too. A missing artifact raises
+                      `FileNotFoundError` and a digest mismatch raises `ValueError`; either
+                      error refuses the load.
             hooks (HookArg): Opt-in prediction hooks; see `laya.hooks`.
             on_predict_start (PredictHookArg): An opt-in start hook, run before inference.
             on_predict_end (PredictHookArg): An opt-in end hook, run after inference.
             hooks_raise: When False, a failing hook warns and inference continues.
             hooks_concurrent: When False, hooks are serialised with a lock.
+            hooks_timeout: Bounds each hook call in seconds; None means no limit.
         """
         self.hooks = normalise_hooks(hooks, on_predict_start, on_predict_end)
         self.hooks_raise = bool(hooks_raise)
         self.hooks_concurrent = bool(hooks_concurrent)
+        self.hooks_timeout = None if hooks_timeout is None else validate_timeout(hooks_timeout)
         self._hooks_lock = threading.RLock() if not hooks_concurrent else None
         self._hooks_mutex = threading.Lock()
         self.model_id = model_id_or_path
@@ -68,6 +86,7 @@ class ONNXAgent(HookRegistry):
         from transformers import AutoTokenizer
 
         model_dir = model_id_or_path
+        self.revision: Optional[str] = None
         if not os.path.exists(model_dir):
             if model_id_or_path.startswith(("/", "./", "../")) or os.path.isabs(model_id_or_path):
                 raise FileNotFoundError(
@@ -75,13 +94,17 @@ class ONNXAgent(HookRegistry):
                 )
             from huggingface_hub import snapshot_download
 
+            revision = resolve_revision(model_id_or_path, revision)
             prefix = f"{subfolder}/" if subfolder else ""
             kw = {
                 "allow_patterns": [prefix + name for name in (
                     "rl_agent_config.json", "tokenizer/*", "encoder/*",
                 )],
             }
+            if revision:
+                kw["revision"] = revision
             model_dir = snapshot_download(model_id_or_path, **kw)
+            self.revision = snapshot_revision(model_dir) or revision
 
         if subfolder:
             model_dir = os.path.join(model_dir, subfolder)
@@ -89,6 +112,9 @@ class ONNXAgent(HookRegistry):
                 raise FileNotFoundError(
                     f"Subfolder {subfolder!r} not found in {model_id_or_path!r}."
                 )
+
+        # Verify integrity before any file in the checkpoint is parsed or executed.
+        verify_digests(model_dir, expected_sha256, onnx_path=onnx_path)
 
         cfg_path = os.path.join(model_dir, "rl_agent_config.json")
         if not os.path.exists(cfg_path):
@@ -182,15 +208,17 @@ class ONNXAgent(HookRegistry):
     def system_one(self, state: Union[str, dict, list], questions: Dict[str, Dict[str, Any]],
                    hooks=None, on_predict_start=None, on_predict_end=None,
                    hooks_raise: Optional[bool] = None,
+                   hooks_timeout: Optional[float] = None,
                    max_len: Optional[int] = None,
                    head_max_len: Optional[int] = None) -> Dict[str, Any]:
         """Evaluate typed questions, running any opt-in hooks around the inference."""
         active = compose_hooks(self.hooks, hooks, on_predict_start, on_predict_end)
         raise_errors = self.hooks_raise if hooks_raise is None else bool(hooks_raise)
+        timeout = self.hooks_timeout if hooks_timeout is None else validate_timeout(hooks_timeout)
         ctx = PredictContext(states=[state], questions=questions, model=self.model_id, agent=self,
                              max_len=max_len, head_max_len=head_max_len)
         try:
-            dispatch(active, "on_predict_start", ctx, raise_errors=raise_errors, lock=self._hooks_lock)
+            dispatch(active, "on_predict_start", ctx, raise_errors=raise_errors, lock=self._hooks_lock, timeout=timeout)
             if ctx.results is None:
                 overrides = {}
                 if ctx.max_len is not None:
@@ -201,7 +229,7 @@ class ONNXAgent(HookRegistry):
         except BaseException as exc:
             ctx.error = exc
             try:
-                dispatch(active, "on_error", ctx, raise_errors=raise_errors, lock=self._hooks_lock)
+                dispatch(active, "on_error", ctx, raise_errors=raise_errors, lock=self._hooks_lock, timeout=timeout)
             except BaseException as hook_exc:
                 exc.__context__ = hook_exc
             raise
@@ -210,7 +238,7 @@ class ONNXAgent(HookRegistry):
             if ctx.results is not None:
                 ctx.usage = aggregate_usage(ctx.results)
             try:
-                dispatch(active, "on_predict_end", ctx, raise_errors=raise_errors, lock=self._hooks_lock)
+                dispatch(active, "on_predict_end", ctx, raise_errors=raise_errors, lock=self._hooks_lock, timeout=timeout)
             except BaseException as hook_exc:
                 if ctx.error is not None:
                     ctx.error.__context__ = hook_exc
@@ -239,7 +267,8 @@ class ONNXAgent(HookRegistry):
         # re-serializing and re-tokenizing the same document inside build_sequence per
         # question (the PyTorch Agent already does this via `state_ids`).
         truncate_left = isinstance(state, list)
-        state_ids = self.tok(
+        state_ids = encode_text(
+            self.tok,
             serialize_state(state).replace(self.tok.mask_token, " "),
             add_special_tokens=False,
         )["input_ids"]
